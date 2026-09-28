@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Self-bootstrapping launcher for UAPorter
+set -e
+
+# Resolve repository root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/.venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
+
+# 1. If venv or dependencies are missing, auto-install immediately
+if [ ! -f "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -c "import rich, click, httpx, yaml" 2>/dev/null; then
+    echo "[UAPorter] Initializing environment and installing dependencies..."
+    python3 -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/pip" install --quiet --upgrade pip
+    "$VENV_DIR/bin/pip" install --quiet -e "$SCRIPT_DIR"
+    echo "[UAPorter] Ready!"
+fi
+
+# 2. Forward all arguments to the CLI
+exec "$VENV_PYTHON" -m uaporter.cli "$@"

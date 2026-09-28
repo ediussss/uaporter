@@ -1,0 +1,20 @@
+flagship:
+  resolution_scale: 1.0
+  fps_cap: 120
+  shadows: hard_and_soft
+  texture_max: 4096
+  astc_block: "4x4"
+
+balanced:
+  resolution_scale: 0.75
+  fps_cap: 60
+  shadows: hard_only
+  texture_max: 2048
+  astc_block: "6x6"
+
+battery_saver:
+  resolution_scale: 0.5
+  fps_cap: 30
+  shadows: none
+  texture_max: 1024
+  astc_block: "8x8"

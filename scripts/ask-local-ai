@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""
+UAPorter Local AI CLI Tool
+Delegates code generation, refactoring, and audits to the local NVIDIA RTX 3050 GPU via Ollama.
+Guarantees 0 MB idle VRAM by enforcing keep_alive: 0.
+Costs 0 Cloud API credits.
+"""
+
+import sys
+import json
+import argparse
+import urllib.request
+import urllib.error
+
+OLLAMA_HOST = "http://127.0.0.1:11434"
+DEFAULT_MODEL = "qwen2.5-coder:7b"
+
+UAPORTER_SYSTEM_PROMPT = (
+    "You are a senior Python & C# developer specializing in Unity game porting. "
+    "You write clean, production-quality code for the UAPorter CLI tool — a Unity "
+    "auto-porter targeting Linux/Steam Deck and Android APK. Follow existing code "
+    "conventions (Click CLI, Rich console, httpx). Output ONLY the requested code "
+    "or diff, no conversational filler."
+)
+
+def call_ollama(prompt, model=DEFAULT_MODEL, system_prompt=None):
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": 0  # Instantly evict model from VRAM after generation
+    }
+    if system_prompt:
+        payload["system"] = system_prompt
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/generate",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            return res.get("response", "")
+    except urllib.error.URLError as e:
+        sys.stderr.write(f"Error: Could not connect to Ollama at {OLLAMA_HOST}. Is 'ollama serve' running? ({e})\n")
+        sys.exit(1)
+    except Exception as e:
+        sys.stderr.write(f"Error during Ollama inference: {e}\n")
+        sys.exit(1)
+
+def get_installed_models():
+    try:
+        req = urllib.request.Request(f"{OLLAMA_HOST}/api/tags")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+
+def select_model_by_task(installed, task_type="code", requested_model=None):
+    if requested_model and requested_model in installed:
+        return requested_model
+    if task_type == "reasoning":
+        for m in installed:
+            if "r1" in m or "deepseek" in m:
+                return m
+    elif task_type == "fast":
+        for m in installed:
+            if "1.5b" in m or "3b" in m or "mini" in m:
+                return m
+    # Default: prioritize coding model
+    for m in installed:
+        if "coder" in m or "qwen" in m:
+            return m
+    return installed[0] if installed else DEFAULT_MODEL
+
+def main():
+    parser = argparse.ArgumentParser(description="UAPorter Local AI (RTX 3050 / Ollama) - 0 Cloud Credits")
+    parser.add_argument("prompt", nargs="?", default="", help="Prompt to send to local model")
+    parser.add_argument("-m", "--model", default=None, help="Explicit model name")
+    parser.add_argument("-t", "--task", choices=["code", "reasoning", "fast", "general"], default="code", help="Task type for automatic model routing")
+    parser.add_argument("-l", "--list", action="store_true", help="List all installed local models")
+    parser.add_argument("-s", "--system", default=None, help="Optional system prompt (overrides built-in UAPorter prompt)")
+    parser.add_argument("-f", "--file", default=None, help="Optional file to prepend as context")
+
+    args = parser.parse_args()
+
+    installed = get_installed_models()
+
+    if args.list:
+        print("=== Installed Local AI Models in Ollama ===")
+        if not installed:
+            print("  No models installed yet. Run: ollama pull qwen2.5-coder:7b")
+        else:
+            for m in installed:
+                print(f"  * {m}")
+        sys.exit(0)
+
+    chosen_model = select_model_by_task(installed, args.task, args.model)
+
+    # Read from stdin if piped
+    stdin_content = ""
+    if not sys.stdin.isatty():
+        stdin_content = sys.stdin.read()
+
+    file_content = ""
+    if args.file:
+        try:
+            with open(args.file, "r", encoding="utf-8", errors="replace") as f:
+                file_content = f.read()
+        except Exception as e:
+            sys.stderr.write(f"Warning: Could not read context file {args.file}: {e}\n")
+
+    full_prompt_parts = []
+    if file_content:
+        full_prompt_parts.append(f"Context File Content:\n```\n{file_content}\n```\n")
+    if stdin_content:
+        full_prompt_parts.append(f"Piped Input:\n```\n{stdin_content}\n```\n")
+    if args.prompt:
+        full_prompt_parts.append(args.prompt)
+
+    full_prompt = "\n".join(full_prompt_parts).strip()
+    if not full_prompt:
+        parser.print_help()
+        sys.exit(1)
+
+    # Use built-in UAPorter system prompt unless overridden
+    system_prompt = args.system if args.system else UAPORTER_SYSTEM_PROMPT
+
+    output = call_ollama(full_prompt, model=chosen_model, system_prompt=system_prompt)
+    sys.stdout.write(output + "\n")
+    sys.stdout.flush()
+
+if __name__ == "__main__":
+    main()
