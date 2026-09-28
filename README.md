@@ -1,6 +1,38 @@
 # Universal Unity Auto-Porter (UAPorter)
 
+> **⚠️ EXPERIMENTAL — v0.1.0**: This project is in early development and may not work correctly. Many features are incomplete or untested. Use at your own risk. Bug reports and contributions are welcome!
+
 Universal Unity Auto-Porter (`uaporter`) is a CLI tool designed to port desktop Unity games to **Linux / Steam Deck** (via zero-recompile runtime swap) and **Android APK** (via automated decompilation, touch control injection, and headless Unity rebuilds).
+
+## How to Download & Install
+
+### Option 1 — Clone & run (recommended)
+```bash
+git clone https://github.com/ediussss/uaporter.git
+cd uaporter
+```
+Then launch directly — it auto-installs all dependencies on first run:
+```bash
+# Linux / Steam Deck / macOS
+./uaporter scan /path/to/YourGame
+
+# Windows
+uaporter.bat scan C:\path\to\YourGame
+```
+
+### Option 2 — Install via pip
+```bash
+pip install git+https://github.com/ediussss/uaporter.git
+uaporter scan /path/to/YourGame
+```
+
+### Requirements
+- **Python 3.10+**
+- **Linux / macOS** or **Windows**
+- Android porting requires: Android SDK + JDK 17
+- A free [Unity Personal license](https://unity.com/products) (only needed for games that require recompilation)
+- AssetRipper — auto-downloaded on first Android port run
+
 
 ## Features
 
