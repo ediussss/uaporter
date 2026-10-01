@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from pathlib import Path
+import shutil
 import click
 from rich.console import Console
 
@@ -11,6 +12,38 @@ from .scanner import scan_game_directory, print_scan_report
 from .desktop.swapper import swap_to_linux
 
 console = Console()
+
+
+def _confirm_existing_build_replacement(
+    output: Path, source_game_dir: Path
+) -> bool:
+    """Require an explicit decision before replacing any generated port project."""
+    if not output.is_dir() or not (output / "ExportedProject").is_dir():
+        return False
+
+    rebuild = click.confirm(
+        f"An existing UAPorter project was found at {output}. "
+        "Delete it and create a fresh project?",
+        default=False,
+    )
+    if not rebuild:
+        console.print(
+            "[yellow]Existing project kept. Cancelling to avoid reusing a previous port.[/yellow]"
+        )
+        raise click.Abort()
+
+    resolved_output = output.resolve()
+    if resolved_output in {
+        Path("/"),
+        Path.home().resolve(),
+        source_game_dir.resolve(),
+    }:
+        raise click.ClickException(
+            f"Refusing to delete unsafe output path: {resolved_output}"
+        )
+    shutil.rmtree(resolved_output)
+    console.print(f"[bold yellow]Deleted previous generated project: {resolved_output}[/bold yellow]")
+    return True
 
 
 @click.group(invoke_without_command=True)
@@ -103,6 +136,10 @@ def port(game_dir: Path, target: str, output: Path | None, force_decompile: bool
 
     if output is None:
         output = game_dir.parent / f"{report.game_name}_{target}"
+    output = output.resolve()
+
+    clean_rebuild = _confirm_existing_build_replacement(output, game_dir)
+    force_decompile = force_decompile or clean_rebuild
 
     if target.lower() == "linux":
         if not report.is_linux_supported:
@@ -242,4 +279,3 @@ def setup_license(username: str, password: str, serial: str) -> None:
 
 if __name__ == "__main__":
     main()
-

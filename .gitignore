@@ -23,6 +23,7 @@ unity_build.log
 
 # Agent workspace instructions & secrets (NEVER commit)
 GEMINI.md
+CLAUDE.md
 shared/.quota_mode
 *.keystore
 *.jks

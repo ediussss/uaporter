@@ -136,3 +136,15 @@ def test_full_scan_report(tmp_path: Path):
     assert report.backend == Backend.MONO
     assert report.is_android_supported is True
     assert report.is_linux_supported is True
+
+
+def test_game_maker_build_is_reported_as_unsupported(tmp_path: Path):
+    game_dir = tmp_path / "MittensDescent"
+    game_dir.mkdir()
+    (game_dir / "Mittens Descent.exe").touch()
+    (game_dir / "data.win").write_bytes(b"FORM")
+
+    report = scan_game_directory(game_dir)
+
+    assert not report.is_linux_supported
+    assert any("GameMaker" in issue for issue in report.blocking_issues)

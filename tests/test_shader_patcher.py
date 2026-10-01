@@ -104,6 +104,70 @@ def test_restore_standard_tmp_shaders_fallback(tmp_path: Path):
     assert (dest / "TMP_SDF-Mobile.shader").is_file()
     assert (dest / "TMPro.cginc").is_file()
 
+def test_restore_postprocessing_dummy_shaders_from_package_cache(tmp_path: Path):
+    from uaporter.android.project_patcher import restore_postprocessing_shaders
+
+    project = tmp_path / "PostProcessingProject"
+    shader_dir = project / "Assets" / "Shader"
+    package_dir = (
+        project / "Library" / "PackageCache" / "com.unity.postprocessing@2.1.7"
+        / "PostProcessing" / "Shaders" / "Builtins"
+    )
+    shader_dir.mkdir(parents=True)
+    package_dir.mkdir(parents=True)
+
+    dummy = shader_dir / "Hidden_PostProcessing_Uber.shader"
+    dummy.write_text(
+        'Shader "Hidden/PostProcessing/Uber" {\n'
+        '  //DummyShaderTextExporter\n'
+        '  SubShader { }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    meta = dummy.with_suffix(".shader.meta")
+    meta.write_text(
+        "fileFormatVersion: 2\nguid: 1234567890abcdef1234567890abcdef\n",
+        encoding="utf-8",
+    )
+    (package_dir / "Uber.shader").write_text(
+        'Shader "Hidden/PostProcessing/Uber"\n{\n'
+        "    HLSLINCLUDE\n"
+        "    ENDHLSL\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (package_dir.parent / "StdLib.hlsl").write_text("// support include\n", encoding="utf-8")
+
+    patches = restore_postprocessing_shaders(project)
+
+    assert patches
+    assert "DummyShaderTextExporter" not in dummy.read_text(encoding="utf-8")
+    assert "HLSLINCLUDE" in dummy.read_text(encoding="utf-8")
+    assert "1234567890abcdef1234567890abcdef" in meta.read_text(encoding="utf-8")
+    assert (project / "Assets/Shader/PostProcessing/StdLib.hlsl").is_file()
+
+
+def test_restore_postprocessing_uses_safe_fallback_without_package(tmp_path: Path):
+    from uaporter.android.project_patcher import restore_postprocessing_shaders
+
+    shader_dir = tmp_path / "Assets" / "Shader"
+    shader_dir.mkdir(parents=True)
+    shader = shader_dir / "Hidden_PostProcessing_Unavailable.shader"
+    shader.write_text(
+        'Shader "Hidden/PostProcessing/Unavailable" {\n'
+        "  //DummyShaderTextExporter\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    patches = restore_postprocessing_shaders(tmp_path)
+
+    assert patches
+    result = shader.read_text(encoding="utf-8")
+    assert "DummyShaderTextExporter" not in result
+    assert "#pragma vertex vert_img" in result
+    assert "tex2D(_MainTex" in result
+
 
 def test_patch_decompiled_project_integration(tmp_path: Path):
     """Integration test verifying patch_decompiled_project restores shaders alongside DLL and manifest patches."""
@@ -238,6 +302,11 @@ def test_get_essential_packages_for_unity():
     p2019 = get_essential_packages_for_unity(UnityVersion(2019, 4, 8, "f1"))
     assert p2019.get("com.unity.ugui") == "1.0.0"
     assert p2019.get("com.unity.textmeshpro") == "2.0.0"
+    p2019_urp = get_essential_packages_for_unity(
+        UnityVersion(2019, 4, 8, "f1"), is_urp=True
+    )
+    assert p2019_urp.get("com.unity.render-pipelines.core") == "7.1.8"
+    assert p2019_urp.get("com.unity.render-pipelines.universal") == "7.1.8"
 
     p2020 = get_essential_packages_for_unity(UnityVersion(2020, 3, 48, "f1"))
     assert p2020.get("com.unity.textmeshpro") == "3.0.6"
@@ -245,6 +314,129 @@ def test_get_essential_packages_for_unity():
     p2021 = get_essential_packages_for_unity(UnityVersion(2021, 1, 4, "f1"))
     assert p2021.get("com.unity.textmeshpro") == "3.0.6"
     assert "com.unity.2d.sprite" in p2021
+
+    p2021_lts = get_essential_packages_for_unity(
+        UnityVersion(2021, 3, 15, "f1"), is_urp=True
+    )
+    assert p2021_lts.get("com.unity.textmeshpro") == "3.0.9"
+    assert p2021_lts.get("com.unity.postprocessing") == "3.5.1"
+    assert p2021_lts.get("com.unity.render-pipelines.core") == "12.1.7"
+
+
+def test_sanitize_render_pipeline_apis_for_older_editor(tmp_path: Path):
+    from uaporter.android.project_patcher import sanitize_render_pipeline_package_apis
+    from uaporter.core.models import UnityVersion
+
+    package = (
+        tmp_path / "Library" / "PackageCache"
+        / "com.unity.render-pipelines.universal@7.1.8" / "Editor"
+    )
+    package.mkdir(parents=True)
+    source = package / "UniversalRenderPipelineCameraEditor.cs"
+    source.write_text(
+        "using System.Collections.Generic;\n"
+        "interface IRemoveAdditionalDataContextualMenu<T> { "
+        "void RemoveComponent(T component, IEnumerable<Component> dependencies); }\n"
+        "class X : IRemoveAdditionalDataContextualMenu<Camera> {\n"
+        "  public void RemoveComponent(Camera camera) {}\n"
+        "  case GraphicsDeviceType.PlayStation5:\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    patches = sanitize_render_pipeline_package_apis(
+        tmp_path, UnityVersion(2019, 4, 8, "f1")
+    )
+
+    updated = (
+        tmp_path
+        / "UAPorterPackages"
+        / "com.unity.render-pipelines.universal"
+        / "Editor"
+        / source.name
+    ).read_text(encoding="utf-8")
+    assert patches
+    assert "RemoveComponent(Camera camera, I" in updated
+    assert "GraphicsDeviceType.PlayStation5" not in updated
+    assert not (
+        tmp_path
+        / "Library"
+        / "PackageCache"
+        / "com.unity.render-pipelines.universal@7.1.8"
+    ).exists()
+
+
+def test_sanitize_render_pipeline_apis_follows_declared_interface(tmp_path: Path):
+    from uaporter.android.project_patcher import sanitize_render_pipeline_package_apis
+    from uaporter.core.models import UnityVersion
+
+    package = (
+        tmp_path / "Packages" / "com.unity.render-pipelines.core@custom"
+    )
+    package.mkdir(parents=True)
+    (package / "ContextualMenuDispatcher.cs").write_text(
+        "using System.Collections.Generic;\n"
+        "interface IRemoveAdditionalDataContextualMenu<T> { "
+        "void RemoveComponent(T component, IEnumerable<Component> dependencies); }\n",
+        encoding="utf-8",
+    )
+    source = package / "CameraEditor.cs"
+    source.write_text(
+        "class X : IRemoveAdditionalDataContextualMenu<Camera> { "
+        "public void RemoveComponent(Camera camera) {} }\n",
+        encoding="utf-8",
+    )
+
+    sanitize_render_pipeline_package_apis(
+        tmp_path, UnityVersion(2022, 3, 0, "f1")
+    )
+
+    assert "IEnumerable<Component> dependencies" in source.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_sanitize_render_pipeline_apis_preserves_local_override_on_rerun(
+    tmp_path: Path,
+):
+    from uaporter.android.project_patcher import sanitize_render_pipeline_package_apis
+    from uaporter.core.models import UnityVersion
+
+    package = tmp_path / "UAPorterPackages" / "com.unity.render-pipelines.universal"
+    editor = package / "Editor"
+    editor.mkdir(parents=True)
+    (editor / "ContextualMenuDispatcher.cs").write_text(
+        "using System.Collections.Generic;\n"
+        "interface IRemoveAdditionalDataContextualMenu<T> { "
+        "void RemoveComponent(T component, IEnumerable<Component> dependencies); }\n",
+        encoding="utf-8",
+    )
+    source = editor / "UniversalRenderPipelineCameraEditor.cs"
+    source.write_text(
+        "class X : IRemoveAdditionalDataContextualMenu<Camera> { "
+        "public void RemoveComponent(Camera camera) {} }\n",
+        encoding="utf-8",
+    )
+    packages = tmp_path / "Packages"
+    packages.mkdir()
+    manifest = packages / "manifest.json"
+    manifest.write_text(
+        '{"dependencies": {"com.unity.render-pipelines.universal": "7.1.8"}}',
+        encoding="utf-8",
+    )
+    (packages / "packages-lock.json").write_text("{}", encoding="utf-8")
+
+    sanitize_render_pipeline_package_apis(
+        tmp_path, UnityVersion(2019, 4, 8, "f1")
+    )
+
+    assert json.loads(manifest.read_text(encoding="utf-8"))["dependencies"][
+        "com.unity.render-pipelines.universal"
+    ] == "file:../UAPorterPackages/com.unity.render-pipelines.universal"
+    assert not (packages / "packages-lock.json").exists()
+    assert "IEnumerable<Component> dependencies" in source.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_disable_resolution_dialog(tmp_path: Path):
@@ -344,6 +536,137 @@ RectTransform:
     patches = sanitize_ui_canvas_layouts(proj)
     # Authentic UI layout must be preserved (no-op)
     assert menu_scene.read_text(encoding="utf-8") == orig_text
+
+
+def test_unify_text_layout_repairs_invalid_rect_transform_vectors(tmp_path: Path):
+    """Invalid exported vectors are repaired without changing valid layout values."""
+    from uaporter.android.project_patcher import unify_text_layout_system
+
+    proj = tmp_path / "InvalidLayoutProject"
+    assets_dir = proj / "Assets"
+    assets_dir.mkdir(parents=True)
+    scene = assets_dir / "invalid.unity"
+    scene.write_text(
+        """--- !u!224 &1
+RectTransform:
+  m_Pivot: {x: .nan, y: 0.5}
+  m_AnchorMin: {x: 0, y: 0}
+  m_AnchorMax: {x: 1e9, y: 1}
+  m_OffsetMin: {x: -10001, y: 2}
+  m_OffsetMax: {x: 3, y: .inf}
+  m_AnchoredPosition: {x: 12.5, y: -3.25}
+""",
+        encoding="utf-8",
+    )
+
+    patches = unify_text_layout_system(proj)
+    result = scene.read_text(encoding="utf-8")
+
+    assert patches
+    assert "m_Pivot: {x: 0.5, y: 0.5}" in result
+    assert "m_AnchorMin: {x: 0, y: 0}" in result
+    assert "m_AnchorMax: {x: 1, y: 1}" in result
+    assert "m_OffsetMin: {x: 0, y: 0}" in result
+    assert "m_OffsetMax: {x: 0, y: 0}" in result
+    assert "m_AnchoredPosition: {x: 12.5, y: -3.25}" in result
+
+
+def test_fix_common_cs_syntax_errors_normalizes_decompiler_wrapped_calls(tmp_path: Path):
+    from uaporter.android.project_patcher import fix_common_cs_syntax_errors
+
+    scripts_dir = tmp_path / "Assets" / "Scripts"
+    scripts_dir.mkdir(parents=True)
+    script = scripts_dir / "SaveManager.cs"
+    script.write_text(
+        'if (PlayerPrefs.HasKey(("save")))\n'
+        '{\n'
+        '    PlayerPrefs.SetString(("save"), value);\n'
+        '}',
+        encoding="utf-8",
+    )
+
+    patches = fix_common_cs_syntax_errors(tmp_path)
+
+    assert patches
+    assert script.read_text(encoding="utf-8") == (
+        'if (PlayerPrefs.HasKey("save"))\n'
+        '{\n'
+        '    PlayerPrefs.SetString("save", value);\n'
+        '}'
+    )
+
+
+def test_fix_common_cs_syntax_errors_repairs_missing_control_parenthesis(tmp_path: Path):
+    from uaporter.android.project_patcher import fix_common_cs_syntax_errors
+
+    scripts_dir = tmp_path / "Assets" / "Scripts"
+    scripts_dir.mkdir(parents=True)
+    script = scripts_dir / "SaveManager.cs"
+    script.write_text('if (PlayerPrefs.HasKey("save")\n{\n}\n', encoding="utf-8")
+
+    fix_common_cs_syntax_errors(tmp_path)
+
+    assert 'if (PlayerPrefs.HasKey("save"))\n' in script.read_text(encoding="utf-8")
+
+
+def test_fix_common_cs_syntax_errors_repairs_truncated_nested_call(tmp_path: Path):
+    from uaporter.android.project_patcher import fix_common_cs_syntax_errors
+
+    scripts_dir = tmp_path / "Assets" / "Scripts"
+    scripts_dir.mkdir(parents=True)
+    script = scripts_dir / "P3dHelper.cs"
+    script.write_text(
+        "return PlayerPrefs.HasKey((saveName);\n",
+        encoding="utf-8",
+    )
+
+    fix_common_cs_syntax_errors(tmp_path)
+
+    assert script.read_text(encoding="utf-8") == (
+        "return PlayerPrefs.HasKey(saveName);\n"
+    )
+
+
+def test_runtime_shim_qualifies_unity_debug_api(tmp_path: Path):
+    from uaporter.android.project_patcher import inject_runtime_compatibility_shims
+
+    (tmp_path / "Assets").mkdir()
+    inject_runtime_compatibility_shims(tmp_path)
+
+    shim = (tmp_path / "Assets/Scripts/Runtime/UAPorterRuntimeCompatibility.cs").read_text(
+        encoding="utf-8"
+    )
+    assert "UnityEngine.Debug.LogWarning" in shim
+    assert "UnityEngine.Debug.LogError" in shim
+    assert "\n                Debug.LogWarning" not in shim
+    assert "\n                Debug.LogError" not in shim
+
+
+def test_editor_helpers_qualify_unity_debug_api(tmp_path: Path):
+    from uaporter.android.project_patcher import inject_runtime_compatibility_shims
+
+    (tmp_path / "Assets").mkdir()
+    inject_runtime_compatibility_shims(tmp_path)
+
+    helpers = (tmp_path / "Assets/Scripts/Editor/UAPorterEditorHelpers.cs").read_text(
+        encoding="utf-8"
+    )
+    assert "UnityEngine.Debug.Log(" in helpers
+    assert "\n            Debug.Log(" not in helpers
+
+
+def test_build_validator_qualifies_shadowable_unity_apis(tmp_path: Path):
+    from uaporter.android.project_patcher import enhance_build_reliability
+
+    (tmp_path / "Assets").mkdir()
+    enhance_build_reliability(tmp_path)
+
+    validator = (tmp_path / "Assets/Scripts/Editor/UAPorterBuildValidator.cs").read_text(
+        encoding="utf-8"
+    )
+    assert "UnityEngine.Debug.Log" in validator
+    assert "UnityEngine.Application.dataPath" in validator
+    assert "\n                Debug.Log" not in validator
 
 
 def test_builder_verify_build_success(tmp_path: Path):
@@ -606,9 +929,3 @@ PluginImporter:
     shader_text = dummy_shader.read_text(encoding="utf-8")
     assert 'Tags { "LightMode" = "Universal2D" }' in shader_text
     assert 'Fallback "Sprites/Default"' in shader_text
-
-
-
-
-
-

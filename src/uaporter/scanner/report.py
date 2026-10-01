@@ -34,7 +34,18 @@ def scan_game_directory(game_path: Path) -> ScanReport:
     warnings: list[str] = []
 
     if not data_dir:
-        blocking_issues.append("Could not locate Unity '_Data' folder.")
+        if (game_path / "data.win").is_file():
+            blocking_issues.append(
+                "This is a GameMaker game (data.win), not a Unity build. "
+                "UAPorter currently supports Unity projects only.\n\n"
+                "Expected layout:\n"
+                "Game.exe\n"
+                "Game_Data/\n"
+                "  globalgamemanagers\n"
+                "  Managed/"
+            )
+        else:
+            blocking_issues.append("Could not locate Unity '_Data' folder.")
     if not unity_ver:
         warnings.append("Could not extract Unity engine version from binary files.")
     if backend == Backend.UNKNOWN:

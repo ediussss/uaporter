@@ -1,6 +1,10 @@
 # Universal Unity Auto-Porter (UAPorter)
 
-> **⚠️ EXPERIMENTAL — v0.1.0**: This project is in early development and may not work correctly. Many features are incomplete or untested. Use at your own risk. Bug reports and contributions are welcome!
+> **⚠️ EXPERIMENTAL — v0.2.0**: This project is in active development and is **far from finished**. Some features may not work correctly or may be incomplete. Use at your own risk. Bug reports and contributions are welcome!
+
+## Version 0.2.0
+
+Version 0.2.0 adds cross-version Unity package compatibility, durable sanitized URP/Core overrides, broader decompiler recovery, improved build diagnostics, and safe handling of rerunning existing generated projects.
 
 Universal Unity Auto-Porter (`uaporter`) is a CLI tool designed to port desktop Unity games to **Linux / Steam Deck** (via zero-recompile runtime swap) and **Android APK** (via automated decompilation, touch control injection, and headless Unity rebuilds).
 
@@ -41,11 +45,21 @@ uaporter scan /path/to/YourGame
 - **Universal Engine Support (Unity 2017–2023+):** Automated dynamic dependency resolution (`libxml2.so.2`, OpenSSL 1.1 `libssl.so.1.1` for Roslyn C# compiler), version-adaptive package manifests (Unity 2018 built-in uGUI & TMP 1.4.1, Unity 2019 TMP 2.0.0, Unity 2020–2022+ TMP 3.0.6 & 2D modules), automated resolution dialog suppression for legacy engines, and automated Linux patch for Unity Bee build system (`--stdin-canary` hang workaround).
 - **Version-Adaptive Headless Builder & Teardown Resilience:** Dynamically adjusts batchmode arguments per engine version (e.g. reserving multi-worker import flags for Unity 2019.3+) and gracefully tolerates legacy Mono teardown signals (`SIGABRT -6` / `SIGSEGV -11`) once build artifacts are verified on disk.
 - **Cross-Platform PostProcessing & ComputeShader Restoration:** Automatically remaps decompiled `PostProcessResources.asset` and scenes to authentic official package shaders and compute shaders (`com.unity.postprocessing`), restoring accurate AutoExposure, Bloom, and Ambient Occlusion without dark-screen rendering errors.
+- **Unity 2019.2 Rendering Recovery:** Uses the editor-matched PostProcessing package and a safe Uber pass-through when that Unity release rejects the package's renderer variants, preventing striped or invalid full-frame output.
+- **Render-Pipeline Version Matching:** URP/Core dependencies are repinned together with the matching Unity editor generation; Unity 2019.4 uses URP 7.1.8 to avoid newer API references such as `GraphicsDeviceType.PlayStation5`.
+- **Unity Release-Train Matching:** Unity 2021.1 and earlier use the 11.x graphics/TMP train, while Unity 2021.2/2021.3 use URP/Core 12.1.7, TMP 3.0.9, and Post Processing 3.5.1. Stale package locks are invalidated when a compatibility version changes.
+- **Render-Pipeline API Sanitization:** Older Unity editors receive targeted fixes for package APIs they do not expose, including URP contextual-menu signatures and newer graphics-device enum cases. This runs across cached URP/Core packages instead of requiring game-specific edits.
+- **Embedded SRP Recovery:** When Unity would regenerate a patched URP/Core cache, UAPorter embeds the sanitized package locally and excludes package tests/samples from player compilation. This keeps compatibility fixes active through the entire import/build cycle.
+- **Local SRP Package Overrides:** Sanitized URP/Core packages are referenced through `file:` dependencies so Unity Package Manager cannot replace them with registry copies during import.
 - **Universal Render Pipeline (URP 2D/3D) & Dummy Shader Sanitization:** Automatic pre-flight URP detection across Managed assemblies, ProjectSettings, and asset hierarchies. Pinned engine-matched URP packages (`com.unity.render-pipelines.universal` & `core`), automated assembly duplicate conflict resolution, GUID remapping for URP components (`Volume`, `VolumeProfile`, `UniversalRenderPipelineAsset`, `Renderer2DData`, `Bloom`), Tilemap engine MonoScripts (`Tile`, `TileBase`), package materials, and automatic transformation of AssetRipper legacy surface dummy shaders into native URP `Universal2D` / `UniversalForward` / `SRPDefaultUnlit` passes with sprite/unlit fallbacks, eliminating black-screen and invisible rendering issues across all Unity versions.
 - **Layout & Developer Intent Preservation:** Strictly preserves native scene UI anchors, off-screen animated panels, and CanvasScaler parameters, ensuring animated menus, popups, and HUDs transition as designed without overlapping text or visual duplication.
 - **High-Speed Quality-Preserving Asset Pipeline:** Optimizes `EditorSettings.asset` and diffuse texture imports for a 50x speedup while strictly preserving high visual fidelity for normal maps, UI sprites, and lightmaps.
 - **TextMeshPro Cross-Version UI Harmonization:** Automatically detects and harmonizes split vs combined TextMeshPro alignment fields (e.g. `m_textAlignment: 65535` vs `m_HorizontalAlignment` / `m_VerticalAlignment`), ensuring speech bubbles, dialogue boxes, and UI text layout render with pixel accuracy across all engine generations.
+- **Unity YAML Layout Compatibility:** Safely repairs non-finite or implausibly extreme RectTransform vectors emitted by decompilers while preserving valid anchors, pivots, offsets, and intentional positioning across Unity versions.
+- **Decompiler C# Syntax Recovery:** Normalizes common malformed double-wrapped method arguments such as `HasKey(("save"))` before Unity compilation, and reports the relevant compiler diagnostics when a build still fails.
+- **Post-Processing Shader Recovery:** Restores authentic built-in PostProcessing shaders and their complete HLSL include tree from the Unity package cache when AssetRipper exports placeholder shaders, rewriting flattened include paths and using a safe pass-through fallback when a package source is unavailable.
 - **AssetRipper Live Extraction & Smart Reuse:** Real-time animated status streaming during AssetRipper extraction (scanning game files, asset discovery, extracting textures/meshes/audio), intelligent existing-project reuse (skips redundant 5+ minute extractions during re-runs or retries, with `--force-decompile` for fresh extractions), automated C# injection (`TouchManager.cs`), headless Unity build orchestration, and APK signing.
+- **Safe Port Reruns:** When an existing generated `ExportedProject` is detected—whether its previous build succeeded or failed—rerunning `port` asks whether to delete it and rebuild cleanly; declining cancels without reusing the old project.
 - **Mobile Optimization:** ASTC texture compression presets and quality profiles (Flagship, Balanced, Battery Saver).
 
 ## Instant Quickstart (Zero-Setup Auto-Install)

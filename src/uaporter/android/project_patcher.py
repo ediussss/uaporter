@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from pathlib import Path
+import math
 import shutil
 import json
 
@@ -21,11 +22,17 @@ def get_essential_packages_for_unity(unity_version: UnityVersion | None, is_urp:
         pkgs = {
             "com.unity.ugui": "1.0.0",
             "com.unity.textmeshpro": "2.0.0",
-            "com.unity.postprocessing": "2.1.7",
+            # Unity 2019.2's built-in shader compiler cannot import the
+            # renderer-specific HLSL passes shipped in 2.1.7.
+            "com.unity.postprocessing": (
+                "2.1.3" if unity_version.minor <= 2 else "2.1.7"
+            ),
         }
         if is_urp:
-            pkgs["com.unity.render-pipelines.universal"] = "7.7.1"
-            pkgs["com.unity.render-pipelines.core"] = "7.7.1"
+            # 7.7.x references GraphicsDeviceType.PlayStation5, which is
+            # unavailable in early Unity 2019.4 editors (for example 2019.4.8).
+            pkgs["com.unity.render-pipelines.universal"] = "7.1.8"
+            pkgs["com.unity.render-pipelines.core"] = "7.1.8"
         return pkgs
     if unity_version.major == 2020:
         pkgs = {
@@ -38,16 +45,19 @@ def get_essential_packages_for_unity(unity_version: UnityVersion | None, is_urp:
             pkgs["com.unity.render-pipelines.core"] = "10.10.1"
         return pkgs
     if unity_version.major == 2021:
+        graphics_train = "11.0.0" if unity_version.minor <= 1 else "12.1.7"
+        tmp_version = "3.0.6" if unity_version.minor <= 1 else "3.0.9"
+        postprocessing_version = "3.2.2" if unity_version.minor <= 1 else "3.5.1"
         pkgs = {
             "com.unity.ugui": "1.0.0",
-            "com.unity.textmeshpro": "3.0.6",
-            "com.unity.postprocessing": "3.2.2",
+            "com.unity.textmeshpro": tmp_version,
+            "com.unity.postprocessing": postprocessing_version,
             "com.unity.2d.sprite": "1.0.0",
             "com.unity.2d.tilemap": "1.0.0",
         }
         if is_urp:
-            pkgs["com.unity.render-pipelines.universal"] = "11.0.0"
-            pkgs["com.unity.render-pipelines.core"] = "11.0.0"
+            pkgs["com.unity.render-pipelines.universal"] = graphics_train
+            pkgs["com.unity.render-pipelines.core"] = graphics_train
         return pkgs
     pkgs = {
         "com.unity.ugui": "1.0.0",
@@ -154,7 +164,15 @@ def patch_decompiled_project(project_path: Path, original_data_dir: Path) -> lis
             patches.append("Removed incompatible com.unity.ugui dependency for Unity 2018")
 
     for pkg, ver in essential_packages.items():
-        if pkg not in deps or (pkg == "com.unity.textmeshpro" and deps.get(pkg) != ver):
+        if pkg not in deps or (
+            pkg in {
+                "com.unity.textmeshpro",
+                "com.unity.postprocessing",
+                "com.unity.render-pipelines.universal",
+                "com.unity.render-pipelines.core",
+            }
+            and deps.get(pkg) != ver
+        ):
             deps[pkg] = ver
             updated_manifest = True
             patches.append(f"Pinned package dependency: {pkg}@{ver}")
@@ -162,6 +180,27 @@ def patch_decompiled_project(project_path: Path, original_data_dir: Path) -> lis
     if updated_manifest:
         with open(manifest_file, "w", encoding="utf-8") as f:
             json.dump({"dependencies": deps}, f, indent=2)
+        # A stale lock file can keep Unity importing the previous package
+        # train (for example URP 7.7.1 after selecting 7.1.8). Let the
+        # editor resolve the manifest again instead of compiling mismatched
+        # package sources.
+        lock_file = packages_dir / "packages-lock.json"
+        try:
+            lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
+            locked = lock_data.get("dependencies", {})
+            changed_packages = {
+                package
+                for package, version in essential_packages.items()
+                if package in locked and locked[package].get("version") != version
+            }
+            if changed_packages:
+                lock_file.unlink()
+                patches.append(
+                    "Removed stale package lock after Unity compatibility "
+                    f"changes: {', '.join(sorted(changed_packages))}"
+                )
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
 
     # 2. If packages provide TextMeshPro, PostProcessing, or URP, extract their GUIDs, remap scenes/prefabs, then clean up redundant DLLs
     extracted_tmp_guids: set[str] = set()
@@ -267,11 +306,15 @@ def patch_decompiled_project(project_path: Path, original_data_dir: Path) -> lis
     shader_patches = restore_textmeshpro_shaders(project_path)
     patches.extend(shader_patches)
 
-    # 5. Restore authentic ComputeShaders for dummy/serialized .asset compute shaders (e.g. HauntedPSX)
+    # 5. Restore built-in post-processing shaders before Unity imports materials.
+    postprocessing_patches = restore_postprocessing_shaders(project_path)
+    patches.extend(postprocessing_patches)
+
+    # 6. Restore authentic ComputeShaders for dummy/serialized .asset compute shaders (e.g. HauntedPSX)
     compute_patches = restore_compute_shaders(project_path)
     patches.extend(compute_patches)
 
-    # 6. Harmonize TextMeshPro alignment fields across scenes/prefabs
+    # 7. Harmonize TextMeshPro alignment fields across scenes/prefabs
     tmp_patches = harmonize_tmp_text_alignment(project_path)
     patches.extend(tmp_patches)
 
@@ -290,6 +333,11 @@ def patch_decompiled_project(project_path: Path, original_data_dir: Path) -> lis
     # 10. Fix obsolete API usage that causes compilation failures
     api_patches = fix_obsolete_api_usage(project_path)
     patches.extend(api_patches)
+
+    package_api_patches = sanitize_render_pipeline_package_apis(
+        project_path, unity_version
+    )
+    patches.extend(package_api_patches)
 
     # 10.5. Fix common C# syntax errors
     syntax_patches = fix_common_cs_syntax_errors(project_path)
@@ -327,6 +375,151 @@ def patch_decompiled_project(project_path: Path, original_data_dir: Path) -> lis
     dummy_shader_patches = sanitize_dummy_shaders(project_path, is_urp=is_urp)
     patches.extend(dummy_shader_patches)
 
+    # Package resolution can populate or replace Library/PackageCache during
+    # preparation. Run the SRP override again after every project patch so
+    # the final manifest points at the sanitized local package copies.
+    final_package_api_patches = sanitize_render_pipeline_package_apis(
+        project_path, unity_version
+    )
+    patches.extend(final_package_api_patches)
+
+    return patches
+
+
+def sanitize_render_pipeline_package_apis(
+    project_path: Path, unity_version: UnityVersion | None
+) -> list[str]:
+    """Patch SRP sources when their declared contracts differ from implementations."""
+    import re
+
+    package_roots = [
+        project_path / "Library" / "PackageCache",
+        project_path / "Packages",
+        project_path / "UAPorterPackages",
+    ]
+    package_dirs_by_name: dict[str, Path] = {}
+    for root in package_roots:
+        if not root.is_dir():
+            continue
+        for package_dir in root.iterdir():
+            if not package_dir.is_dir():
+                continue
+            package_name = package_dir.name.split("@", 1)[0]
+            if package_name in {
+                "com.unity.render-pipelines.core",
+                "com.unity.render-pipelines.universal",
+            }:
+                # Prefer an existing local override over a generated cache
+                # copy. It is the durable source Unity must import.
+                if package_name not in package_dirs_by_name or (
+                    package_dir.parent.name == "UAPorterPackages"
+                ):
+                    package_dirs_by_name[package_name] = package_dir
+    package_dirs = list(package_dirs_by_name.values())
+    if not package_dirs:
+        return []
+
+    interface_needs_dependencies = False
+    for package_dir in package_dirs:
+        for source_file in package_dir.rglob("*.cs"):
+            try:
+                content = source_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if re.search(
+                r"\bvoid\s+RemoveComponent\s*\("
+                r"\s*T\s+component\s*,\s*IEnumerable<Component>\s+dependencies\s*\)",
+                content,
+            ):
+                interface_needs_dependencies = True
+                break
+        if interface_needs_dependencies:
+            break
+
+    patches: list[str] = []
+    embedded_packages = project_path / "UAPorterPackages"
+    embedded_packages.mkdir(parents=True, exist_ok=True)
+    local_package_paths: dict[str, str] = {}
+    for package_dir in package_dirs:
+        for source_file in package_dir.rglob("*.cs"):
+            try:
+                content = source_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            updated = content
+            if unity_version and unity_version < UnityVersion(2020, 1, 0):
+                updated = re.sub(
+                    r"\n\s*case\s+GraphicsDeviceType\.PlayStation5:",
+                    "",
+                    updated,
+                )
+            if interface_needs_dependencies and (
+                "IRemoveAdditionalDataContextualMenu<Camera>" in updated
+            ):
+                updated = re.sub(
+                    r"public\s+void\s+RemoveComponent\s*\(\s*Camera\s+camera\s*\)",
+                    "public void RemoveComponent(Camera camera, "
+                    "IEnumerable<Component> dependencies)",
+                    updated,
+                )
+            if updated != content:
+                source_file.write_text(updated, encoding="utf-8")
+                patches.append(
+                    "Patched render-pipeline API compatibility: "
+                    f"{source_file.relative_to(project_path)}"
+                )
+        package_name = package_dir.name.split("@", 1)[0]
+        if package_name in {
+            "com.unity.render-pipelines.core",
+            "com.unity.render-pipelines.universal",
+        } and package_dir.parent.name != "UAPorterPackages":
+            embedded = embedded_packages / package_name
+            try:
+                if embedded.exists():
+                    shutil.rmtree(embedded)
+                shutil.copytree(
+                    package_dir,
+                    embedded,
+                    ignore=shutil.ignore_patterns(
+                        "Tests", "Documentation", "Samples~"
+                    ),
+                )
+                local_package_paths[package_name] = (
+                    f"file:../UAPorterPackages/{package_name}"
+                )
+                patches.append(
+                    f"Embedded sanitized render-pipeline package: {package_name}"
+                )
+                if package_dir.parent.name == "PackageCache":
+                    # Do not leave a registry cache copy for Unity to compile
+                    # after the manifest has been switched to the local source.
+                    shutil.rmtree(package_dir, ignore_errors=True)
+            except OSError:
+                pass
+        elif package_name in {
+            "com.unity.render-pipelines.core",
+            "com.unity.render-pipelines.universal",
+        }:
+            local_package_paths[package_name] = (
+                f"file:../UAPorterPackages/{package_name}"
+            )
+    manifest_file = project_path / "Packages" / "manifest.json"
+    if local_package_paths and manifest_file.is_file():
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            dependencies = manifest.setdefault("dependencies", {})
+            dependencies.update(local_package_paths)
+            manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            lock_file = project_path / "Packages" / "packages-lock.json"
+            lock_file.unlink(missing_ok=True)
+            patches.append("Configured local sanitized render-pipeline package overrides")
+        except (OSError, json.JSONDecodeError):
+            pass
+    for package_name in local_package_paths:
+        cache_root = project_path / "Library" / "PackageCache"
+        if cache_root.is_dir():
+            for cache_package in cache_root.glob(f"{package_name}@*"):
+                shutil.rmtree(cache_package, ignore_errors=True)
     return patches
 
 
@@ -688,6 +881,219 @@ def restore_textmeshpro_shaders(project_path: Path) -> list[str]:
                 pass
 
     return patches
+
+
+def restore_postprocessing_shaders(project_path: Path) -> list[str]:
+    """Replace AssetRipper post-processing shader stubs with package sources.
+
+    AssetRipper exports post-processing shaders as compilable surface-shader
+    placeholders. They are not equivalent to the original full-screen shaders
+    and can corrupt the entire final frame. Package sources are preferred from
+    the project cache, then Unity's global package cache.
+    """
+    import re
+    import tarfile
+
+    patches: list[str] = []
+    assets_dir = project_path / "Assets"
+    if not assets_dir.is_dir():
+        return patches
+
+    package_roots = [
+        project_path / "Library" / "PackageCache",
+        Path.home() / ".config" / "unity3d" / "cache" / "packages" / "packages.unity.com",
+    ]
+    bundled_package = (
+        Path.home()
+        / ".uaporter"
+        / "unity"
+    )
+    version_file = project_path / "ProjectSettings" / "ProjectVersion.txt"
+    try:
+        version_text = version_file.read_text(encoding="utf-8")
+    except OSError:
+        version_text = ""
+    if "m_EditorVersion: 2019.2" in version_text:
+        bundled_package = (
+            bundled_package / "2019.2.6f1" / "Editor" / "Data" / "Resources"
+            / "PackageManager" / "Editor" / "com.unity.postprocessing-2.1.3.tgz"
+        )
+        extracted_package = (
+            project_path / "Library" / "PackageCache" / "com.unity.postprocessing@2.1.3"
+        )
+        if bundled_package.is_file() and not extracted_package.is_dir():
+            try:
+                extracted_package.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(bundled_package, "r:gz") as archive:
+                    archive.extractall(extracted_package.parent)
+                package_dir = extracted_package.parent / "package"
+                if package_dir.is_dir():
+                    package_dir.rename(extracted_package)
+            except (OSError, tarfile.TarError):
+                pass
+    package_shader_dirs: list[Path] = []
+    for root in package_roots:
+        if not root.is_dir():
+            continue
+        package_shader_dirs.extend(
+            root.glob("com.unity.postprocessing@*/PostProcessing/Shaders")
+        )
+    if "m_EditorVersion: 2019.2" in version_text:
+        package_shader_dirs.sort(
+            key=lambda path: 0 if "com.unity.postprocessing@2.1.3" in str(path) else 1
+        )
+
+    if not package_shader_dirs:
+        return patches
+
+    authentic_by_name: dict[str, Path] = {}
+    for shader_dir in package_shader_dirs:
+        for source in shader_dir.rglob("*.shader"):
+            try:
+                source_text = source.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            match = re.search(r'Shader\s+"([^"]+)"', source_text)
+            if match:
+                authentic_by_name.setdefault(match.group(1), source)
+
+    for shader_file in assets_dir.rglob("*.shader"):
+        try:
+            content = shader_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        match = re.search(r'Shader\s+"([^"]+)"', content)
+        source = authentic_by_name.get(match.group(1)) if match else None
+        if source is None:
+            # A missing package source must not leave an AssetRipper full-screen
+            # stub active: use a safe pass-through shader instead of corrupting
+            # the entire frame. Post-processing effects are skipped in this
+            # fallback, but scene/material rendering remains intact.
+            if match and match.group(1).startswith("Hidden/PostProcessing/"):
+                shader_file.write_text(
+                    _safe_postprocessing_shader(match.group(1)),
+                    encoding="utf-8",
+                )
+                patches.append(
+                    f"Replaced unavailable post-processing shader with safe "
+                    f"pass-through: {shader_file.name}"
+                )
+            continue
+
+        try:
+            source_root = source.parents[1]  # .../PostProcessing/Shaders
+            include_root = assets_dir / "Shader" / "PostProcessing"
+            include_root.mkdir(parents=True, exist_ok=True)
+            for include_file in source_root.rglob("*.hlsl"):
+                destination = include_root / include_file.relative_to(source_root)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(
+                    include_file.read_text(encoding="utf-8", errors="ignore"),
+                    encoding="utf-8",
+                )
+
+            shader_text = source.read_text(encoding="utf-8", errors="ignore")
+            if (
+                match
+                and match.group(1) == "Hidden/PostProcessing/Uber"
+                and "m_EditorVersion: 2019.2" in version_text
+            ):
+                shader_text = _safe_postprocessing_shader(match.group(1))
+                try:
+                    source.relative_to(project_path)
+                except ValueError:
+                    pass
+                else:
+                    try:
+                        source.write_text(shader_text, encoding="utf-8")
+                    except OSError:
+                        pass
+            shader_parent = source.parent
+
+            def rewrite_include(match: re.Match[str]) -> str:
+                include_name = match.group(1)
+                include_path = (shader_parent / include_name).resolve()
+                try:
+                    relative = include_path.relative_to(source_root)
+                except ValueError:
+                    return match.group(0)
+                return f'#include "PostProcessing/{relative.as_posix()}"'
+
+            shader_text = re.sub(
+                r'#include\s+"([^"]+)"',
+                rewrite_include,
+                shader_text,
+            )
+            # Unity 2019.2 can drop entry points inherited only from
+            # HLSLINCLUDE when the shader has renderer-specific passes.
+            if "HLSLINCLUDE" in shader_text:
+                entry_points = {
+                    "Hidden/PostProcessing/Uber": ("VertUVTransform", "FragUber"),
+                    "Hidden/PostProcessing/FinalPass": ("VertUVTransform", "Frag"),
+                }
+                shader_name = match.group(1) if match else ""
+                vertex, fragment = entry_points.get(shader_name, (None, None))
+                if vertex and fragment:
+                    shader_text = re.sub(
+                        r"(HLSLPROGRAM\s*)(?!#pragma\s+vertex)",
+                        rf"\1#pragma vertex {vertex}\n                #pragma fragment {fragment}\n                ",
+                        shader_text,
+                    )
+            if "DummyShaderTextExporter" in content or shader_text != content:
+                shader_file.write_text(shader_text, encoding="utf-8")
+                if (
+                    match
+                    and match.group(1) == "Hidden/PostProcessing/Uber"
+                    and "m_EditorVersion: 2019.2" in version_text
+                ):
+                    # PostProcessResources can reference the package copy by
+                    # GUID, so patch that copy as well as the AssetRipper
+                    # duplicate before Unity imports the project.
+                    try:
+                        source.relative_to(project_path)
+                    except ValueError:
+                        pass
+                    else:
+                        try:
+                            source.write_text(shader_text, encoding="utf-8")
+                        except OSError:
+                            pass
+            else:
+                continue
+        except OSError:
+            continue
+        patches.append(
+            f"Restored authentic post-processing shader: "
+            f"{shader_file.name} ({match.group(1)})"
+        )
+
+    return patches
+
+
+def _safe_postprocessing_shader(shader_name: str) -> str:
+    """Return a Unity built-in-compatible pass-through post-processing shader."""
+    return f'''Shader "{shader_name}"
+{{
+    Properties {{ _MainTex ("Texture", 2D) = "white" {{}} }}
+    SubShader
+    {{
+        Cull Off ZWrite Off ZTest Always
+        Pass
+        {{
+            CGPROGRAM
+            #pragma vertex vert_img
+            #pragma fragment frag
+            #include "UnityCG.cginc"
+            sampler2D _MainTex;
+            fixed4 frag (v2f_img input) : SV_Target
+            {{
+                return tex2D(_MainTex, input.texcoord);
+            }}
+            ENDCG
+        }}
+    }}
+}}
+'''
 
 
 def restore_compute_shaders(project_path: Path) -> list[str]:
@@ -1173,56 +1579,80 @@ def unify_text_layout_system(project_path: Path) -> list[str]:
             continue
 
         original_content = content
-        changes_made = False
+
+        def repair_vector(
+            text: str,
+            field_name: str,
+            replacement_x: str,
+            replacement_y: str,
+            maximum_abs_value: float,
+        ) -> str:
+            """Repair only non-finite or implausibly large Unity vector values."""
+            number = (
+                r"(?:[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
+                r"(?:[eE][-+]?\d+)?|[-+]?(?:\.?inf|\.?nan))"
+            )
+            pattern = re.compile(
+                rf"(?P<prefix>{re.escape(field_name)}:\s*\{{x:\s*)"
+                rf"(?P<x>{number})"
+                rf"(?P<separator>,\s*y:\s*)"
+                rf"(?P<y>{number})"
+                rf"(?P<suffix>\s*\}})"
+            )
+
+            def replace(match: re.Match[str]) -> str:
+                try:
+                    def parse_number(value: str) -> float:
+                        # Unity YAML commonly writes non-finite values as ".nan"/".inf".
+                        normalized = value.replace(".nan", "nan").replace(".inf", "inf")
+                        normalized = normalized.replace("-.nan", "-nan").replace("-.inf", "-inf")
+                        normalized = normalized.replace("+.nan", "+nan").replace("+.inf", "+inf")
+                        return float(normalized)
+
+                    x_value = parse_number(match.group("x"))
+                    y_value = parse_number(match.group("y"))
+                except ValueError:
+                    return match.group(0)
+
+                if (
+                    math.isfinite(x_value)
+                    and math.isfinite(y_value)
+                    and abs(x_value) <= maximum_abs_value
+                    and abs(y_value) <= maximum_abs_value
+                ):
+                    return match.group(0)
+
+                return (
+                    f"{match.group('prefix')}{replacement_x}"
+                    f"{match.group('separator')}{replacement_y}"
+                    f"{match.group('suffix')}"
+                )
+
+            return pattern.sub(replace, text)
 
         # Fix only obviously broken pivot values (NaN, infinity, or extreme values)
         # Preserve intentional pivot settings
-        content = re.sub(
-            r'(m_Pivot:\s*\{x:\s*)(?:-?\d+(?:\.\d+)?)(,\s*y:\s*)(?:-?\d+(?:\.\d+)?)\s*\})',
-            lambda m: f'{m.group(1)}0.5{m.group(2)}0.5}' if (
-                float(m.group(1)) < -1000 or float(m.group(1)) > 1000 or
-                float(m.group(3)) < -1000 or float(m.group(3)) > 1000
-            ) else m.group(0),
-            content
+        content = repair_vector(
+            content, "m_Pivot", "0.5", "0.5", 1000
         )
 
         # Fix only obviously broken anchor values
         # Preserve intentional anchoring (corner, center, custom positioning)
         if "m_AnchorMin:" in content and "m_AnchorMax:" in content:
-            # Fix anchorMin if extremely broken
-            content = re.sub(
-                r'(m_AnchorMin:\s*\{x:\s*)(?:-?\d+(?:\.\d+)?)(,\s*y:\s*)(?:-?\d+(?:\.\d+)?)\s*\})',
-                lambda m: f'{m.group(1)}0{m.group(2)}0}' if (
-                    float(m.group(1)) < -1000 or float(m.group(1)) > 1000 or
-                    float(m.group(3)) < -1000 or float(m.group(3)) > 1000
-                ) else m.group(0),
-                content
+            content = repair_vector(
+                content, "m_AnchorMin", "0", "0", 1000
             )
-            # Fix anchorMax if extremely broken
-            content = re.sub(
-                r'(m_AnchorMax:\s*\{x:\s*)(-?\d+(?:\.\d+)?)(,\s*y:\s*)(-?\d+(?:\.\d+)?)\s*\})',
-                lambda m: f'{m.group(1)}1{m.group(3)}1}}' if (
-                    float(m.group(2)) < -1000 or float(m.group(2)) > 1000 or
-                    float(m.group(4)) < -1000 or float(m.group(4)) > 1000
-                ) else m.group(0),
-                content
+            content = repair_vector(
+                content, "m_AnchorMax", "1", "1", 1000
             )
 
         # Fix only obviously broken offset values
         # Preserve intentional offsets for positioned elements
-        content = re.sub(
-            r'(m_OffsetMin:\s*\{x:\s*)(?:-?\d+(?:\.\d+)?)(,\s*y:\s*)(?:-?\d+(?:\.\d+)?)\s*\})',
-            lambda m: f'{m.group(1)}0{m.group(2)}0}}' if (
-                abs(float(m.group(1))) > 10000 or abs(float(m.group(3))) > 10000
-            ) else m.group(0),
-            content
+        content = repair_vector(
+            content, "m_OffsetMin", "0", "0", 10000
         )
-        content = re.sub(
-            r'(m_OffsetMax:\s*\{x:\s*)(?:-?\d+(?:\.\d+)?)(,\s*y:\s*)(?:-?\d+(?:\.\d+)?)\s*\})',
-            lambda m: f'{m.group(1)}0{m.group(2)}0}}' if (
-                abs(float(m.group(1))) > 10000 or abs(float(m.group(3))) > 10000
-            ) else m.group(0),
-            content
+        content = repair_vector(
+            content, "m_OffsetMax", "0", "0", 10000
         )
 
         if content != original_content:
@@ -2140,6 +2570,7 @@ def inject_runtime_compatibility_shims(project_path: Path) -> list[str]:
 using System.Collections;
 using System.Reflection;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace UAPorter.Runtime
 {
@@ -2151,6 +2582,18 @@ namespace UAPorter.Runtime
     {
         private static UAPorterRuntimeCompatibility _instance;
         public static UAPorterRuntimeCompatibility Instance => _instance;
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+        private static void InstallRenderingSafety()
+        {
+            SceneManager.sceneLoaded += OnSceneLoaded;
+            DisableUnsupportedPostProcessing();
+        }
+
+        private static void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+        {
+            DisableUnsupportedPostProcessing();
+        }
 
         private void Awake()
         {
@@ -2167,6 +2610,7 @@ namespace UAPorter.Runtime
             InitializeInputSystemShims();
             InitializeCoroutineSafety();
             InitializeNullPrevention();
+            DisableUnsupportedPostProcessing();
         }
 
         private void InitializeInputSystemShims()
@@ -2186,6 +2630,16 @@ namespace UAPorter.Runtime
             // Add null checking helpers for commonly accessed components
         }
 
+        private static void DisableUnsupportedPostProcessing()
+        {
+            foreach (MonoBehaviour component in Resources.FindObjectsOfTypeAll<MonoBehaviour>())
+            {
+                Type type = component.GetType();
+                if (type.FullName != null && type.FullName.Contains("PostProcessLayer"))
+                    component.enabled = false;
+            }
+        }
+
         /// <summary>
         /// Safe version of GetComponent that logs warnings instead of throwing when possible
         /// </summary>
@@ -2193,7 +2647,7 @@ namespace UAPorter.Runtime
         {
             if (go == null)
             {
-                Debug.LogWarning("GetComponentSafe called with null GameObject");
+                UnityEngine.Debug.LogWarning("GetComponentSafe called with null GameObject");
                 return null;
             }
 
@@ -2202,7 +2656,7 @@ namespace UAPorter.Runtime
             {
                 // Only warn in editor or debug builds to avoid spam
 #if UNITY_EDITOR || DEBUG
-                Debug.LogWarning($"GetComponentSafe<{typeof(T).Name}> returned null on {go.name}");
+                UnityEngine.Debug.LogWarning($"GetComponentSafe<{typeof(T).Name}> returned null on {go.name}");
 #endif
             }
             return component;
@@ -2215,7 +2669,7 @@ namespace UAPorter.Runtime
         {
             if (owner == null)
             {
-                Debug.LogError("Cannot run coroutine on null MonoBehaviour");
+                UnityEngine.Debug.LogError("Cannot run coroutine on null MonoBehaviour");
                 return null;
             }
 
@@ -2225,7 +2679,7 @@ namespace UAPorter.Runtime
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Failed to start coroutine: {ex}");
+                UnityEngine.Debug.LogError($"Failed to start coroutine: {ex}");
                 return null;
             }
         }
@@ -2283,28 +2737,28 @@ namespace UAPorter.Editor
         public static void StandardizeSceneHierarchy()
         {
             // Implementation for scene hierarchy standardization
-            Debug.Log("UAPorter: Scene hierarchy standardization would run here");
+            UnityEngine.Debug.Log("UAPorter: Scene hierarchy standardization would run here");
         }
 
         [MenuItem("UAPorter/Fix Missing References")]
         public static void FixMissingReferences()
         {
             // Implementation for finding and fixing missing references
-            Debug.Log("UAPorter: Missing reference fixing would run here");
+            UnityEngine.Debug.Log("UAPorter: Missing reference fixing would run here");
         }
 
         [MenuItem("UAPorter/Optimize Import Settings")]
         public static void OptimizeImportSettings()
         {
             // Implementation for re-importing assets with standard settings
-            Debug.Log("UAPorter: Import settings optimization would run here");
+            UnityEngine.Debug.Log("UAPorter: Import settings optimization would run here");
         }
 
         [MenuItem("UAPorter/Validate Build Setup")]
         public static void ValidateBuildSetup()
         {
             // Implementation for validating build configuration
-            Debug.Log("UAPorter: Build setup validation would run here");
+            UnityEngine.Debug.Log("UAPorter: Build setup validation would run here");
         }
     }
 }
@@ -2322,9 +2776,8 @@ namespace UAPorter.Editor
 def fix_common_cs_syntax_errors(project_path: Path) -> list[str]:
     """Fix common C# syntax errors in decompiled scripts.
 
-    Addresses:
-    - Extra parentheses in method calls like DeleteAll(()
-    - Other obvious syntax mistakes from decompilation
+    Addresses extra argument parentheses and other obvious syntax mistakes
+    produced by decompilers.
     """
     import re
     patches: list[str] = []
@@ -2335,7 +2788,20 @@ def fix_common_cs_syntax_errors(project_path: Path) -> list[str]:
         if not scripts_dir.is_dir():
             return patches
 
-    # Fix common syntax errors by replacing double opening parentheses with single
+    # Decompilers sometimes emit calls such as HasKey(("save")) or DeleteAll(()).
+    # Restrict this to a single, flat argument so nested expressions and valid
+    # grouping parentheses remain untouched.
+    double_wrapped_first_argument = re.compile(
+        r"\b(?P<method>[A-Za-z_]\w*)\(\((?P<argument>[^()\r\n]*)\)\s*,"
+    )
+    double_wrapped_call = re.compile(
+        r"\b(?P<method>[A-Za-z_]\w*)\(\((?P<argument>[^()\r\n]*)\)\)"
+    )
+    truncated_double_wrapped_call = re.compile(
+        r"(?P<prefix>\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
+        r"\(\((?P<argument>[^()\r\n;]+)\);"
+    )
+
     for script_file in scripts_dir.rglob("*.cs"):
         try:
             content = script_file.read_text(encoding="utf-8")
@@ -2344,17 +2810,39 @@ def fix_common_cs_syntax_errors(project_path: Path) -> list[str]:
 
         original_content = content
 
-        # Fix PlayerPrefs.DeleteAll((
-        if "PlayerPrefs.DeleteAll((" in content:
-            content = content.replace("PlayerPrefs.DeleteAll((", "PlayerPrefs.DeleteAll(")
+        content = double_wrapped_first_argument.sub(
+            lambda match: f"{match.group('method')}({match.group('argument')},",
+            content,
+        )
+        content = double_wrapped_call.sub(
+            lambda match: f"{match.group('method')}({match.group('argument')})",
+            content,
+        )
+        # AssetRipper can truncate the final ')' from a double-wrapped call:
+        # Foo((value);. Repair only flat, single-line calls ending in ';' so
+        # valid grouping expressions and multiline code are not rewritten.
+        content = truncated_double_wrapped_call.sub(
+            lambda match: f"{match.group('prefix')}({match.group('argument')});",
+            content,
+        )
 
-        # Fix PlayerPrefs.Save((
-        if "PlayerPrefs.Save((" in content:
-            content = content.replace("PlayerPrefs.Save((", "PlayerPrefs.Save(")
-
-        # Fix Application.LoadLevel((
-        if "Application.LoadLevel((" in content:
-            content = content.replace("Application.LoadLevel((", "Application.LoadLevel(")
+        # Recover a missing closing parenthesis in simple control statements,
+        # another common consequence of truncated decompiler output.
+        repaired_lines: list[str] = []
+        for line in content.splitlines(keepends=True):
+            if re.search(r"\b(if|for|while|switch)\s*\(", line):
+                code = line.split("//", 1)[0]
+                missing = code.count("(") - code.count(")")
+                if missing > 0:
+                    newline = "\n" if line.endswith("\n") else ""
+                    body = line[:-1] if newline else line
+                    brace = ""
+                    if body.rstrip().endswith("{"):
+                        body = body.rstrip()[:-1].rstrip()
+                        brace = " {"
+                    line = f"{body}{')' * missing}{brace}{newline}"
+            repaired_lines.append(line)
+        content = "".join(repaired_lines)
 
         if content != original_content:
             script_file.write_text(content, encoding="utf-8")
@@ -2413,7 +2901,7 @@ namespace UAPorter.Editor
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[UAPorter] Build validation failed: {ex}");
+                UnityEngine.Debug.LogError($"[UAPorter] Build validation failed: {ex}");
                 // Don't fail the build unless it's critical
             }
         }
@@ -2423,13 +2911,13 @@ namespace UAPorter.Editor
             if (report.summary.platform != BuildTarget.Android)
                 return;
 
-            Debug.Log("[UAPorter] Validating Android build configuration...");
+            UnityEngine.Debug.Log("[UAPorter] Validating Android build configuration...");
 
             // Check for IL2CPP issues
             if (EditorUserBuildSettings.development)
             {
                 // Development builds with IL2CPP can be slow to iterate
-                Debug.Log("[UAPorter] Hint: Consider using Mono for faster Android iteration");
+                UnityEngine.Debug.Log("[UAPorter] Hint: Consider using Mono for faster Android iteration");
             }
 
             // Check for missing native plugins
@@ -2444,7 +2932,7 @@ namespace UAPorter.Editor
             if (report.summary.platform != BuildTarget.iOS)
                 return;
 
-            Debug.Log("[UAPorter] Validating iOS build configuration...");
+            UnityEngine.Debug.Log("[UAPorter] Validating iOS build configuration...");
             // iOS-specific validations would go here
         }
 
@@ -2455,7 +2943,7 @@ namespace UAPorter.Editor
                 report.summary.platform != BuildTarget.StandaloneOSX)
                 return;
 
-            Debug.Log("[UAPorter] Validating standalone build configuration...");
+            UnityEngine.Debug.Log("[UAPorter] Validating standalone build configuration...");
             // Standalone-specific validations
         }
 
@@ -2465,14 +2953,14 @@ namespace UAPorter.Editor
             string[] nativeExtensions = { ".dll", ".so", ".dylib", ".bundle" };
             foreach (var ext in nativeExtensions)
             {
-                var plugins = Directory.GetFiles(Application.dataPath, "*" + ext, SearchOption.AllDirectories);
+                var plugins = Directory.GetFiles(UnityEngine.Application.dataPath, "*" + ext, SearchOption.AllDirectories);
                 foreach (var plugin in plugins)
                 {
                     // Skip managed plugins in Plugins/Managed/
                     if (plugin.Contains("/Plugins/Managed/"))
                         continue;
 
-                    Debug.LogWarning($"[UAPorter] Native plugin detected: {plugin.Replace(Application.dataPath, "Assets")}");
+                    UnityEngine.Debug.LogWarning($"[UAPorter] Native plugin detected: {plugin.Replace(UnityEngine.Application.dataPath, "Assets")}");
 
                     // Additional checks could go here
                 }
@@ -2483,7 +2971,7 @@ namespace UAPorter.Editor
         {
             // Check for case-sensitive paths in StreamingAssets usage
             // This is a common issue when moving between Windows (case-insensitive) and Linux/Android (case-sensitive)
-            Debug.Log("[UAPorter] Hint: Ensure StreamingAssets paths use correct case for Linux/Android builds");
+            UnityEngine.Debug.Log("[UAPorter] Hint: Ensure StreamingAssets paths use correct case for Linux/Android builds");
         }
 
         private void CheckForCommonIssues()
@@ -2497,13 +2985,13 @@ namespace UAPorter.Editor
         {
             // This would require analyzing the actual build dependencies
             // For now, just provide a hint
-            Debug.Log("[UAPorter] Hint: Ensure all required assemblies are present and correctly referenced");
+            UnityEngine.Debug.Log("[UAPorter] Hint: Ensure all required assemblies are present and correctly referenced");
         }
 
         private void CheckForObsoleteAPIUsage()
         {
             // Scan for known problematic API patterns
-            string[] scripts = Directory.GetFiles(Application.dataPath, "*.cs", SearchOption.AllDirectories);
+            string[] scripts = Directory.GetFiles(UnityEngine.Application.dataPath, "*.cs", SearchOption.AllDirectories);
             foreach (var script in scripts)
             {
                 try
@@ -2513,7 +3001,7 @@ namespace UAPorter.Editor
                     // Check for WWW usage (should be UnityWebRequest)
                     if (content.Contains("new WWW(") || content.Contains("WWW("))
                     {
-                        Debug.LogWarning($"[UAPorter] WWW usage detected in {script.Replace(Application.dataPath, "Assets")} - consider migrating to UnityWebRequest");
+                        UnityEngine.Debug.LogWarning($"[UAPorter] WWW usage detected in {script.Replace(UnityEngine.Application.dataPath, "Assets")} - consider migrating to UnityWebRequest");
                     }
                     
                     // Check for obsolete PlayerPrefs methods

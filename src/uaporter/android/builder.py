@@ -126,6 +126,25 @@ def _verify_build_success(
     return False
 
 
+def _read_build_diagnostics(log_file_path: Path, limit: int = 8) -> str:
+    """Return the most useful compiler/build error lines from a Unity log."""
+    if not log_file_path.is_file():
+        return ""
+    try:
+        lines = log_file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return ""
+
+    diagnostics = [
+        line.strip()
+        for line in lines
+        if any(marker in line for marker in ("error CS", "Build Failed", "Scripts have compiler errors"))
+    ]
+    if not diagnostics:
+        return ""
+    return " Compiler diagnostics: " + " | ".join(diagnostics[-limit:])
+
+
 def _clean_stale_locks(project_path: Path) -> None:
     """Clean up stale lockfiles and orphaned temporary sockets from previous aborted runs."""
     import glob
@@ -169,6 +188,11 @@ def run_headless_build(
     UnityManager.patch_bee_backend(unity_editor_path)
 
     unity_version = _get_project_unity_version(project_path)
+    # Package resolution may recreate Library/PackageCache after the project
+    # patch phase. Sanitize resolved SRP sources immediately before Unity
+    # starts compiling assemblies.
+    from .project_patcher import sanitize_render_pipeline_package_apis
+    sanitize_render_pipeline_package_apis(project_path, unity_version)
     cmd = [
         str(unity_editor_path),
         "-batchmode",
@@ -197,6 +221,7 @@ def run_headless_build(
 
     if not _verify_build_success(returncode, output_apk_path, log_file_path, "Android"):
         err_msg = f"Unity headless build failed with exit code {returncode}."
+        err_msg += _read_build_diagnostics(log_file_path)
         if log_file_path.exists():
             err_msg += f" See log: {log_file_path}"
         raise UnityBuildError(err_msg)
@@ -231,6 +256,8 @@ def run_headless_linux_build(
     UnityManager.patch_bee_backend(unity_editor_path)
 
     unity_version = _get_project_unity_version(project_path)
+    from .project_patcher import sanitize_render_pipeline_package_apis
+    sanitize_render_pipeline_package_apis(project_path, unity_version)
     cmd = [
         str(unity_editor_path),
         "-batchmode",
@@ -259,6 +286,7 @@ def run_headless_linux_build(
 
     if not _verify_build_success(returncode, output_bin_path, log_file_path, "Linux"):
         err_msg = f"Unity headless Linux build failed with exit code {returncode}."
+        err_msg += _read_build_diagnostics(log_file_path)
         if log_file_path.exists():
             err_msg += f" See log: {log_file_path}"
         raise UnityBuildError(err_msg)
